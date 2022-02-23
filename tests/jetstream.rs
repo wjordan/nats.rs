@@ -778,6 +778,66 @@ fn jetstream_pull_subscribe_ephemeral() {
 }
 
 #[test]
+fn jetstream_pull_subscribe_one_shot() {
+    let s = util::run_server("tests/configs/jetstream.conf");
+    let nc = nats::Options::new()
+        .error_callback(|err| println!("error!: {}", err))
+        .connect(&s.client_url())
+        .unwrap();
+    let js = nats::jetstream::new(nc);
+
+    js.add_stream(&StreamConfig {
+        name: "TEST".to_string(),
+        subjects: vec!["foo".to_string()],
+        ..Default::default()
+    })
+    .unwrap();
+
+    js.stream_info("TEST").unwrap();
+
+    for _ in 0..1000 {
+        js.publish("foo", b"foo").unwrap();
+    }
+
+    let consumer = js.pull_subscribe("foo").unwrap();
+    let iter = consumer
+        .timeout_fetch(
+            BatchOptions {
+                expires: Some(Duration::from_secs(10).as_nanos() as usize),
+                batch: 500,
+                no_wait: true,
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap();
+
+    let mut i = 0;
+    for message in iter {
+        i += 1;
+        message.unwrap();
+    }
+    assert_eq!(i, 500);
+
+    let iter = consumer
+        .timeout_fetch(
+            BatchOptions {
+                expires: Some(Duration::from_secs(10).as_nanos() as usize),
+                batch: 600,
+                no_wait: true,
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap();
+
+    let mut i = 0;
+    for message in iter {
+        i += 1;
+        // message.unwrap();
+    }
+    assert_eq!(i, 500);
+}
+
+#[test]
 fn jetstream_pull_subscribe_bad_stream() {
     let s = util::run_server("tests/configs/jetstream.conf");
     let nc = nats::Options::new()
