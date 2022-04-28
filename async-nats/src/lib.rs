@@ -105,6 +105,8 @@ use futures_util::future::FutureExt;
 use futures_util::select;
 use futures_util::stream::Stream;
 use futures_util::StreamExt;
+use options::{Callback, ErrorCallback};
+use tls::TlsOptions;
 
 use std::collections::HashMap;
 use std::iter;
@@ -207,6 +209,7 @@ pub(crate) enum ServerOp {
     Info(Box<ServerInfo>),
     Ping,
     Pong,
+    Error(ServerError),
     Message {
         sid: u64,
         subject: String,
@@ -293,6 +296,17 @@ impl Connection {
             self.buffer.advance(6);
 
             return Ok(Some(ServerOp::Pong));
+        }
+
+        if self.buffer.starts_with(b"-ERR") {
+            if let Some(len) = self.buffer.find(b"\r\n") {
+                let line = std::str::from_utf8(&self.buffer[5..len])
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+                let error_message = line.trim_matches('\'').to_string();
+                self.buffer.advance(len + 2);
+
+                return Ok(Some(ServerOp::Error(ServerError::new(error_message))));
+            }
         }
 
         if self.buffer.starts_with(b"INFO ") {
@@ -463,7 +477,7 @@ impl Connection {
 /// Maintains a list of servers and establishes connections.
 pub(crate) struct Connector {
     server_addrs: Vec<ServerAddr>,
-    options: ConnectOptions,
+    tls_options: TlsOptions,
 }
 
 impl Connector {
@@ -492,7 +506,7 @@ impl Connector {
         &self,
         server_addr: &ServerAddr,
     ) -> Result<(ServerInfo, Connection), io::Error> {
-        let tls_config = tls::config_tls(&self.options).await?;
+        let tls_config = tls::config_tls(&self.tls_options).await?;
 
         let tcp_stream = TcpStream::connect((server_addr.host(), server_addr.port())).await?;
         tcp_stream.set_nodelay(true)?;
@@ -520,7 +534,7 @@ impl Connector {
         };
 
         let tls_required =
-            self.options.tls_required || info.tls_required || server_addr.tls_required();
+            self.tls_options.tls_required || info.tls_required || server_addr.tls_required();
 
         if tls_required {
             let tls_config = Arc::new(tls_config);
@@ -629,12 +643,13 @@ impl ConnectionHandler {
     pub async fn process(
         &mut self,
         mut receiver: mpsc::Receiver<Command>,
+        events: mpsc::Sender<ServerEvent>,
     ) -> Result<(), io::Error> {
         loop {
             select! {
                 maybe_command = receiver.recv().fuse() => {
                     match maybe_command {
-                        Some(command) => if let Err(err) = self.handle_command(command).await {
+                        Some(command) => if let Err(err) = self.handle_command(command, &events).await {
                             println!("error handling command {}", err);
                         }
                         None => {
@@ -645,12 +660,15 @@ impl ConnectionHandler {
 
                 maybe_op_result = self.connection.read_op().fuse() => {
                     match maybe_op_result {
-                        Ok(Some(server_op)) => if let Err(err) = self.handle_server_op(server_op).await {
+                        Ok(Some(server_op)) => if let Err(err) = self.handle_server_op(server_op, &events).await {
                             println!("error handling operation {}", err);
                         }
                         Ok(None) => {
+                            events.try_send(ServerEvent::Disconnect).ok();
                             if let Err(err) = self.handle_reconnect().await {
                                 println!("error handling operation {}", err);
+                            } else {
+                                events.try_send(ServerEvent::Reconnect).ok();
                             }
                         }
                         Err(_) => {},
@@ -664,10 +682,17 @@ impl ConnectionHandler {
         Ok(())
     }
 
-    async fn handle_server_op(&mut self, server_op: ServerOp) -> Result<(), io::Error> {
+    async fn handle_server_op(
+        &mut self,
+        server_op: ServerOp,
+        events: &mpsc::Sender<ServerEvent>,
+    ) -> Result<(), io::Error> {
         match server_op {
             ServerOp::Ping => {
                 self.connection.write_op(ClientOp::Pong).await?;
+            }
+            ServerOp::Error(error) => {
+                events.try_send(ServerEvent::Error(error)).ok();
             }
             ServerOp::Message {
                 sid,
@@ -719,7 +744,11 @@ impl ConnectionHandler {
         Ok(())
     }
 
-    async fn handle_command(&mut self, command: Command) -> Result<(), io::Error> {
+    async fn handle_command(
+        &mut self,
+        command: Command,
+        events: &mpsc::Sender<ServerEvent>,
+    ) -> Result<(), io::Error> {
         match command {
             Command::Unsubscribe { uid, max } => {
                 let mut context = self.subscription_context.lock().await;
@@ -753,13 +782,21 @@ impl ConnectionHandler {
             }
             Command::Ping => {
                 while let Err(err) = self.connection.write_op(ClientOp::Ping).await {
+                    events.try_send(ServerEvent::Disconnect).ok();
                     self.handle_reconnect().await?;
+                    events.try_send(ServerEvent::Reconnect).ok();
                 }
             }
             Command::Flush { result } => {
-                result.send(self.connection.flush().await).map_err(|_| {
-                    io::Error::new(io::ErrorKind::Other, "one shot failed to be received")
-                })?;
+                if let Err(err) = self.connection.flush().await {
+                                   events.try_send(ServerEvent::Disconnect).ok();
+                                    self.handle_reconnect().await?;
+                                    events.try_send(ServerEvent::Reconnect).ok();
+                } else {
+                             result.send(()).map_err(|_| {
+                                    io::Error::new(io::ErrorKind::Other, "one shot failed to be received")
+                                })?;
+                }
             }
             Command::TryFlush => {
                 if let Err(err) = self.connection.write_op(ClientOp::TryFlush).await {
@@ -797,7 +834,9 @@ impl ConnectionHandler {
                     })
                     .await
                 {
+                    events.try_send(ServerEvent::Disconnect).ok();
                     self.handle_reconnect().await?;
+                    events.try_send(ServerEvent::Reconnect).ok();
                     println!("Sending Publish failed with {:?}", err);
                 }
             }
@@ -807,7 +846,9 @@ impl ConnectionHandler {
                     .write_op(ClientOp::Connect(connect_info.clone()))
                     .await
                 {
+                    events.try_send(ServerEvent::Disconnect).ok();
                     self.handle_reconnect().await?;
+                    events.try_send(ServerEvent::Reconnect).ok();
                 }
             }
         }
@@ -838,21 +879,67 @@ impl ConnectionHandler {
 /// Client is a `Clonable` handle to NATS connection.
 /// Client should not be created directly. Instead, one of two methods can be used:
 /// [connect] and [ConnectOptions::connect]
-#[derive(Clone)]
 pub struct Client {
     sender: mpsc::Sender<Command>,
+    errors: Option<mpsc::Receiver<ServerError>>,
     subscription_context: Arc<Mutex<SubscriptionContext>>,
+}
+
+impl Clone for Client {
+    fn clone(&self) -> Self {
+        Client {
+            sender: self.sender.clone(),
+            errors: None,
+            subscription_context: self.subscription_context.clone(),
+        }
+    }
 }
 
 impl Client {
     pub(crate) fn new(
         sender: mpsc::Sender<Command>,
+        errors: Option<mpsc::Receiver<ServerError>>,
         subscription_context: Arc<Mutex<SubscriptionContext>>,
     ) -> Client {
         Client {
             sender,
+            errors,
             subscription_context,
         }
+    }
+
+    /// Returns stream of asynchronous errors received from NATS server.
+    ///
+    /// # Examples
+    /// ```
+    /// # use futures_util::StreamExt;
+    /// # #[tokio::main]
+    /// # async fn main() -> std::io::Result<()> {
+    /// let mut nc = async_nats::connect("demo.nats.io").await?;
+    ///
+    /// let mut errs = nc.errors_stream().await?;
+    /// tokio::spawn({
+    ///    async move {
+    ///        if let Some(err) = errs.next().await {
+    ///             println!("received error: {}", err);
+    ///        };
+    ///    }
+    /// });
+    /// # Ok(())
+    /// # }
+    ///
+    /// ```
+    pub async fn errors_stream(&mut self) -> io::Result<Errors> {
+        let errors = self.errors.take();
+        errors.map_or_else(
+            || {
+                Err(io::Error::new(
+                    ErrorKind::AlreadyExists,
+                    "errors stream already consumerd or used on cloned Client",
+                ))
+            },
+            |errors| Ok(Errors::new(errors)),
+        )
     }
 
     pub async fn publish(&mut self, subject: String, payload: Bytes) -> Result<(), Error> {
@@ -983,9 +1070,21 @@ pub async fn connect_with_options<A: ToServerAddrs>(
     addrs: A,
     options: ConnectOptions,
 ) -> Result<Client, io::Error> {
+    let tls_required = options.tls_required;
+    let ping_interval = options.ping_interval;
+    let flush_interval = options.flush_interval;
+
+    let tls_options = TlsOptions {
+        tls_required: options.tls_required,
+        certificates: options.certificates,
+        client_key: options.client_key,
+        client_cert: options.client_cert,
+        tls_client_config: options.tls_client_config,
+    };
+
     let mut connector = Connector {
         server_addrs: addrs.to_server_addrs()?.into_iter().collect(),
-        options: options.clone(),
+        tls_options,
     };
 
     let (_, connection) = connector.try_connect().await?;
@@ -995,9 +1094,10 @@ pub async fn connect_with_options<A: ToServerAddrs>(
 
     // TODO make channel size configurable
     let (sender, receiver) = mpsc::channel(128);
-    let client = Client::new(sender.clone(), subscription_context);
+    let (errors_tx, errors_rx) = mpsc::channel(128);
+    let client = Client::new(sender.clone(), Some(errors_rx), subscription_context);
     let connect_info = ConnectInfo {
-        tls_required: options.tls_required,
+        tls_required,
         // FIXME(tp): have optional name
         name: Some("beta-rust-client".to_string()),
         pedantic: false,
@@ -1030,7 +1130,7 @@ pub async fn connect_with_options<A: ToServerAddrs>(
         let sender = sender.clone();
         async move {
             loop {
-                tokio::time::sleep(options.ping_interval).await;
+                tokio::time::sleep(ping_interval).await;
                 match sender.send(Command::Ping).await {
                     Ok(()) => {}
                     Err(_) => return,
@@ -1041,7 +1141,7 @@ pub async fn connect_with_options<A: ToServerAddrs>(
 
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(options.flush_interval).await;
+            tokio::time::sleep(flush_interval).await;
             match sender.send(Command::TryFlush).await {
                 Ok(()) => {}
                 Err(_) => return,
@@ -1049,9 +1149,26 @@ pub async fn connect_with_options<A: ToServerAddrs>(
         }
     });
 
-    task::spawn(async move { connection_handler.process(receiver).await });
+    let (events_tx, mut events_rx) = mpsc::channel(128);
+    task::spawn(async move {
+        while let Some(event) = events_rx.recv().await {
+            match event {
+                ServerEvent::Reconnect => options.reconnect_callback.call().await,
+                ServerEvent::Disconnect => options.disconnect_callback.call().await,
+                ServerEvent::Error(error) => options.error_callback.call(error).await,
+            }
+        }
+    });
+
+    task::spawn(async move { connection_handler.process(receiver, events_tx).await });
 
     Ok(client)
+}
+
+pub(crate) enum ServerEvent {
+    Reconnect,
+    Disconnect,
+    Error(ServerError),
 }
 
 /// Connects to NATS with default config.
@@ -1195,6 +1312,48 @@ impl Stream for Subscriber {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.receiver.poll_recv(cx)
+    }
+}
+
+#[derive(Debug)]
+pub struct Errors {
+    receiver: tokio::sync::mpsc::Receiver<ServerError>,
+}
+
+impl Errors {
+    fn new(receiver: tokio::sync::mpsc::Receiver<ServerError>) -> Errors {
+        Errors { receiver }
+    }
+}
+
+impl Stream for Errors {
+    type Item = ServerError;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.receiver.poll_recv(cx)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum ServerError {
+    AuthorizationViolation,
+    Other(String),
+}
+
+impl ServerError {
+    fn new(error: String) -> ServerError {
+        match error.as_str() {
+            "authorization violation" => ServerError::AuthorizationViolation,
+            other => ServerError::Other(other.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for ServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AuthorizationViolation => write!(f, "nats: authorization violation"),
+            Self::Other(error) => write!(f, "nats: {}", error),
+        }
     }
 }
 

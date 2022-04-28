@@ -11,7 +11,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Client, ToServerAddrs};
+use crate::{Client, ServerError, ToServerAddrs};
+use futures::future::BoxFuture;
 use std::{fmt, path::PathBuf, time::Duration};
 use tokio::io;
 use tokio_rustls::rustls;
@@ -29,7 +30,6 @@ use tokio_rustls::rustls;
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone)]
 pub struct ConnectOptions {
     // pub(crate) auth: AuthStyle,
     pub(crate) name: Option<String>,
@@ -44,6 +44,9 @@ pub struct ConnectOptions {
     pub(crate) tls_client_config: Option<rustls::ClientConfig>,
     pub(crate) flush_interval: Duration,
     pub(crate) ping_interval: Duration,
+    pub(crate) reconnect_callback: Callback,
+    pub(crate) disconnect_callback: Callback,
+    pub(crate) error_callback: ErrorCallback,
 }
 
 impl fmt::Debug for ConnectOptions {
@@ -80,6 +83,9 @@ impl Default for ConnectOptions {
             tls_client_config: None,
             flush_interval: Duration::from_millis(100),
             ping_interval: Duration::from_secs(60),
+            reconnect_callback: Callback(None),
+            disconnect_callback: Callback(None),
+            error_callback: ErrorCallback(None),
         }
     }
 }
@@ -99,7 +105,7 @@ impl ConnectOptions {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new() -> Self {
+    pub fn new() -> ConnectOptions {
         ConnectOptions::default()
     }
 
@@ -113,8 +119,8 @@ impl ConnectOptions {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn connect<A: ToServerAddrs>(&mut self, addrs: A) -> io::Result<Client> {
-        crate::connect_with_options(addrs, self.to_owned()).await
+    pub async fn connect<A: ToServerAddrs>(self, addrs: A) -> io::Result<Client> {
+        crate::connect_with_options(addrs, self).await
     }
 
     /// Loads root certificates by providing the path to them.
@@ -161,7 +167,7 @@ impl ConnectOptions {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn require_tls(&mut self, is_required: bool) -> &mut ConnectOptions {
+    pub fn require_tls<'a>(&'a mut self, is_required: bool) -> &'a mut ConnectOptions {
         self.tls_required = is_required;
         self
     }
@@ -198,5 +204,76 @@ impl ConnectOptions {
     pub fn ping_interval(&mut self, ping_interval: Duration) -> &mut ConnectOptions {
         self.ping_interval = ping_interval;
         self
+    }
+
+    pub fn error_callback<F>(&mut self, cb: F) -> &mut ConnectOptions
+    where
+        F: Fn(ServerError) -> BoxFuture<'static, ()> + Send + Sync + 'static,
+    {
+        self.error_callback = ErrorCallback(Some(Box::new(cb)));
+        self
+    }
+
+    pub fn reconnect_callback<F>(&mut self, cb: F) -> &mut ConnectOptions
+    where
+        F: Fn() -> BoxFuture<'static, ()> + Send + Sync + 'static,
+    {
+        self.reconnect_callback = Callback(Some(Box::new(cb)));
+        self
+    }
+
+    pub fn disconnect_callback<F>(&mut self, cb: F) -> &mut ConnectOptions
+    where
+        F: Fn() -> BoxFuture<'static, ()> + Send + Sync + 'static,
+    {
+        self.disconnect_callback = Callback(Some(Box::new(cb)));
+        self
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Callback(Option<Box<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync + 'static>>);
+impl Callback {
+    pub async fn call(&self) {
+        if let Some(callback) = self.0.as_ref() {
+            callback().await
+        }
+    }
+}
+
+impl fmt::Debug for Callback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        f.debug_map()
+            .entry(
+                &"callback",
+                if self.0.is_some() { &"set" } else { &"unset" },
+            )
+            .finish()
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ErrorCallback(
+    Option<Box<dyn Fn(ServerError) -> BoxFuture<'static, ()> + Send + Sync + 'static>>,
+);
+
+impl ErrorCallback {
+    pub async fn call(&self, err: ServerError) {
+        if let Some(callback) = self.0.as_ref() {
+            callback(err).await
+        } else {
+            println!("error returned from server: {}", err);
+        }
+    }
+}
+
+impl fmt::Debug for ErrorCallback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        f.debug_map()
+            .entry(
+                &"callback",
+                if self.0.is_some() { &"set" } else { &"unset" },
+            )
+            .finish()
     }
 }
