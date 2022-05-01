@@ -134,7 +134,7 @@ impl ConnectOptions {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn add_root_certificates(&mut self, path: PathBuf) -> &mut ConnectOptions {
+    pub fn add_root_certificates(mut self, path: PathBuf) -> ConnectOptions {
         self.certificates = vec![path];
         self
     }
@@ -150,7 +150,7 @@ impl ConnectOptions {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn add_client_certificate(&mut self, cert: PathBuf, key: PathBuf) -> &mut ConnectOptions {
+    pub fn add_client_certificate(mut self, cert: PathBuf, key: PathBuf) -> ConnectOptions {
         self.client_cert = Some(cert);
         self.client_key = Some(key);
         self
@@ -167,7 +167,7 @@ impl ConnectOptions {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn require_tls<'a>(&'a mut self, is_required: bool) -> &'a mut ConnectOptions {
+    pub fn require_tls(mut self, is_required: bool) -> ConnectOptions {
         self.tls_required = is_required;
         self
     }
@@ -185,7 +185,7 @@ impl ConnectOptions {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn flush_interval(&mut self, flush_interval: Duration) -> &mut ConnectOptions {
+    pub fn flush_interval(mut self, flush_interval: Duration) -> ConnectOptions {
         self.flush_interval = flush_interval;
         self
     }
@@ -201,12 +201,12 @@ impl ConnectOptions {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn ping_interval(&mut self, ping_interval: Duration) -> &mut ConnectOptions {
+    pub fn ping_interval(mut self, ping_interval: Duration) -> ConnectOptions {
         self.ping_interval = ping_interval;
         self
     }
 
-    pub fn error_callback<F>(&mut self, cb: F) -> &mut ConnectOptions
+    pub fn error_callback<F>(mut self, cb: F) -> ConnectOptions
     where
         F: Fn(ServerError) -> BoxFuture<'static, ()> + Send + Sync + 'static,
     {
@@ -214,7 +214,7 @@ impl ConnectOptions {
         self
     }
 
-    pub fn reconnect_callback<F>(&mut self, cb: F) -> &mut ConnectOptions
+    pub fn reconnect_callback<F>(mut self, cb: F) -> ConnectOptions
     where
         F: Fn() -> BoxFuture<'static, ()> + Send + Sync + 'static,
     {
@@ -222,7 +222,7 @@ impl ConnectOptions {
         self
     }
 
-    pub fn disconnect_callback<F>(&mut self, cb: F) -> &mut ConnectOptions
+    pub fn disconnect_callback<F>(mut self, cb: F) -> ConnectOptions
     where
         F: Fn() -> BoxFuture<'static, ()> + Send + Sync + 'static,
     {
