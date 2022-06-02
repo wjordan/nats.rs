@@ -895,4 +895,21 @@ impl Options {
             inner: self.inner.add_root_certificate(path),
         }
     }
+
+    /// Select option to ignore additional servers discovered via INFO messages.
+    ///
+    /// # Example
+    /// ```
+    /// # fn main() -> std::io::Result<()> {
+    /// let nc = nats::asynk::Options::new()
+    ///     .ignore_discovered_urls()
+    ///     .connect("demo.nats.io")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn ignore_discovered_urls(mut self) -> Options {
+        Options {
+            inner: self.inner.ignore_discovered_urls(),
+        }
+    }
 }
