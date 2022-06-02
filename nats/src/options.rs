@@ -46,6 +46,7 @@ pub struct Options {
     pub(crate) reconnect_delay_callback: ReconnectDelayCallback,
     pub(crate) close_callback: Callback,
     pub(crate) lame_duck_callback: Callback,
+    pub(crate) ignore_discovered_urls: bool,
 }
 
 impl fmt::Debug for Options {
@@ -68,6 +69,7 @@ impl fmt::Debug for Options {
             .entry(&"reconnect_delay_callback", &"set")
             .entry(&"close_callback", &self.close_callback)
             .entry(&"lame_duck_callback", &self.lame_duck_callback)
+            .entry(&"ignore_discovered_urls", &self.ignore_discovered_urls)
             .finish()
     }
 }
@@ -92,6 +94,7 @@ impl Default for Options {
             close_callback: Callback(None),
             lame_duck_callback: Callback(None),
             tls_client_config: crate::rustls::ClientConfig::default(),
+            ignore_discovered_urls: false,
         }
     }
 }
@@ -660,6 +663,22 @@ impl Options {
     /// ```
     pub fn add_root_certificate(mut self, path: impl AsRef<Path>) -> Options {
         self.certificates.push(path.as_ref().to_owned());
+        self
+    }
+
+    /// Select option to ignore additional servers discovered via INFO messages.
+    ///
+    /// # Example
+    /// ```
+    /// # fn main() -> std::io::Result<()> {
+    /// let nc = nats::Options::new()
+    ///     .ignore_discovered_urls()
+    ///     .connect("demo.nats.io")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn ignore_discovered_urls(mut self) -> Options {
+        self.ignore_discovered_urls = true;
         self
     }
 }

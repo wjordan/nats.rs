@@ -831,8 +831,10 @@ impl Client {
 
             match op {
                 ServerOp::Info(server_info) => {
-                    for url in &server_info.connect_urls {
-                        connector.add_server(url.parse()?);
+                    if !self.options.ignore_discovered_urls {
+                        for url in &server_info.connect_urls {
+                            connector.add_server(url.parse()?);
+                        }
                     }
                     self.process_info(&server_info, connector);
                     *self.server_info.lock() = server_info;

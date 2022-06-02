@@ -189,8 +189,10 @@ impl Connector {
                     };
 
                     // Add URLs discovered through the INFO message.
-                    for url in &server_info.connect_urls {
-                        self.add_server(url.parse()?);
+                    if !self.options.ignore_discovered_urls {
+                        for url in &server_info.connect_urls {
+                            self.add_server(url.parse()?);
+                        }
                     }
 
                     *self.attempts.get_mut(server).unwrap() = 0;
